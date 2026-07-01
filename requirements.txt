@@ -1,0 +1,9 @@
+#hadoop 
+#spark 
+pyspark>=3.5
+
+# Notebook
+jupyter
+
+# viz
+matplotlib
