@@ -20,6 +20,7 @@ from pyspark.ml import Pipeline
 from pyspark.ml.classification import RandomForestClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.feature import StringIndexer, VectorAssembler
+from pyspark.ml.functions import vector_to_array
 
 st.set_page_config(page_title="Détection de fraude bancaire", layout="wide")
 
@@ -31,8 +32,7 @@ st.set_page_config(page_title="Détection de fraude bancaire", layout="wide")
 def get_spark():
     return SparkSession.builder \
         .appName("DetectionFraude-Streamlit") \
-        .config("spark.driver.memory", "4g") \
-        .config("spark.executor.memory", "4g") \
+        .config("spark.driver.memory", "6g") \
         .getOrCreate()
 
 
@@ -77,7 +77,10 @@ def charger_et_analyser(_spark, chemin_hdfs: str, mode_test: bool, fraction: flo
     moy_fraude = df.filter(df.isFraud == 1).agg(F.avg("amount")).collect()[0][0] or 0.0
     moy_non_fraude = df.filter(df.isFraud == 0).agg(F.avg("amount")).collect()[0][0] or 0.0
 
-    # --- 6. Nettoyage ---------------------------------------------------------
+    # --- 6. Anomalies par personne : a-t-on un historique par emetteur ? -----
+    nb_emetteurs_uniques = df.select("nameOrig").distinct().count()
+
+    # --- 7. Nettoyage ---------------------------------------------------------
     df = df.dropDuplicates()
     df = df.select(
         "step", "type", "amount",
@@ -120,7 +123,7 @@ def charger_et_analyser(_spark, chemin_hdfs: str, mode_test: bool, fraction: flo
         return {
             "nom": nom, "auc": auc, "recall": recall,
             "vp": vp, "fn": fn, "fp": fp, "importances": importances,
-        }
+        }, predictions
 
     col_avec_soldes = [
         "step", "type_num", "amount",
@@ -130,8 +133,23 @@ def charger_et_analyser(_spark, chemin_hdfs: str, mode_test: bool, fraction: flo
     ]
     col_sans_soldes = ["step", "type_num", "amount", "typeEchange_num"]
 
-    modele_1 = entrainer_evaluer(col_avec_soldes, "Modèle 1 (avec soldes)")
-    modele_2 = entrainer_evaluer(col_sans_soldes, "Modèle 2 (sans soldes)")
+    modele_1, _ = entrainer_evaluer(col_avec_soldes, "Modèle 1 (avec soldes)")
+    modele_2, predictions_2 = entrainer_evaluer(col_sans_soldes, "Modèle 2 (sans soldes)")
+
+    # --- Ajustement du seuil (modele 2) : le seuil par defaut (0.5) est trop
+    # haut pour un dataset aussi desequilibre -> on teste plusieurs seuils.
+    pred_2 = predictions_2.withColumn("proba_fraude", vector_to_array("probability")[1])
+    pred_2.cache()
+    pred_2.count()
+
+    seuils = [0.5, 0.3, 0.2, 0.1, 0.05]
+    recalls_seuil, alertes_seuil = [], []
+    for s in seuils:
+        vp_s = pred_2.filter((pred_2.isFraud == 1) & (pred_2.proba_fraude >= s)).count()
+        fn_s = pred_2.filter((pred_2.isFraud == 1) & (pred_2.proba_fraude < s)).count()
+        fp_s = pred_2.filter((pred_2.isFraud == 0) & (pred_2.proba_fraude >= s)).count()
+        recalls_seuil.append(100 * vp_s / (vp_s + fn_s) if (vp_s + fn_s) else 0.0)
+        alertes_seuil.append(fp_s)
 
     return {
         "nb_lignes": nb_lignes,
@@ -141,7 +159,9 @@ def charger_et_analyser(_spark, chemin_hdfs: str, mode_test: bool, fraction: flo
         "fraudes_par_type": fraudes_par_type,
         "fraudes_par_echange": fraudes_par_echange,
         "moy_fraude": moy_fraude, "moy_non_fraude": moy_non_fraude,
+        "nb_emetteurs_uniques": nb_emetteurs_uniques,
         "modele_1": modele_1, "modele_2": modele_2,
+        "seuils": seuils, "recalls_seuil": recalls_seuil, "alertes_seuil": alertes_seuil,
     }
 
 
@@ -168,8 +188,9 @@ if lancer:
 
 r = st.session_state["resultats"]
 
-tab_banque, tab_explo, tab_modeles, tab_comparaison = st.tabs(
-    ["1. Système banque", "2. Exploration", "3. Modèles Random Forest", "4. Comparaison"]
+tab_banque, tab_explo, tab_modeles, tab_comparaison, tab_seuil, tab_limites = st.tabs(
+    ["1. Système banque", "2. Exploration", "3. Modèles Random Forest", "4. Comparaison",
+     "5. Ajustement du seuil", "6. Limites (anomalies)"]
 )
 
 # --- Onglet 1 : système anti-fraude de la banque ----------------------------
@@ -266,4 +287,58 @@ with tab_comparaison:
         "Le modèle 1 (AUC très élevée) se base en grande partie sur les colonnes de soldes, "
         "qui sont modifiées APRÈS la fraude (fuite de données). Le modèle 2, sans ces colonnes, "
         "est plus honnête même si ses scores sont plus bas."
+    )
+
+# --- Onglet 5 : ajustement du seuil (modèle 2) --------------------------------
+with tab_seuil:
+    st.subheader("Le modèle 2 rate beaucoup de fraudes : et si on baissait le seuil ?")
+    st.caption(
+        "Par défaut, une transaction est classée « fraude » si sa probabilité dépasse 0.5. "
+        "Sur un dataset aussi déséquilibré (~0.13% de fraudes), une transaction dépasse rarement "
+        "ce seuil : on le baisse pour attraper plus de fraudes, au prix de plus de fausses alertes."
+    )
+
+    fig = px.line(
+        x=r["seuils"], y=r["recalls_seuil"], markers=True,
+        labels={"x": "seuil", "y": "recall (%)"}, title="Recall selon le seuil (modèle 2)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig = px.line(
+        x=r["seuils"], y=r["alertes_seuil"], markers=True,
+        labels={"x": "seuil", "y": "nb fausses alertes"}, title="Fausses alertes selon le seuil (modèle 2)",
+    )
+    fig.update_traces(line_color="red")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info("Plus on baisse le seuil, plus on attrape de fraudes, mais plus on a de fausses alertes : c'est un compromis à choisir selon le coût de chaque erreur.")
+
+# --- Onglet 6 : limites (anomalies par personne) -------------------------------
+with tab_limites:
+    st.subheader("Peut-on détecter les fraudes via l'historique d'une personne ?")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Transactions", f"{r['nb_lignes']:,}")
+    c2.metric("Émetteurs uniques (nameOrig)", f"{r['nb_emetteurs_uniques']:,}")
+    c3.metric("Transactions / personne", round(r["nb_lignes"] / r["nb_emetteurs_uniques"], 2) if r["nb_emetteurs_uniques"] else 0)
+
+    st.warning(
+        "Le nombre d'émetteurs uniques est quasiment égal au nombre de transactions : chaque "
+        "personne n'apparaît (quasiment) qu'une seule fois. Il n'y a donc PAS d'historique par "
+        "personne dans PaySim, et on ne peut pas faire de détection d'anomalie par comportement "
+        "(d'où le choix de la classification globale plutôt qu'une détection d'anomalie individuelle)."
+    )
+
+    st.markdown(
+        """
+**Colonnes qui manquent pour une vraie détection d'anomalie par personne :**
+
+| Colonne | À quoi ça sert |
+|---|---|
+| id client récurrent | Suivre une personne dans le temps |
+| date + heure précise | Voir les habitudes horaires |
+| lieu / pays | Repérer une transaction à l'étranger inhabituelle |
+| appareil / IP | Détecter une connexion depuis un nouvel appareil |
+| catégorie du marchand | Voir si l'achat sort des habitudes |
+| solde moyen habituel | Comparer à la normale de la personne |
+"""
     )
